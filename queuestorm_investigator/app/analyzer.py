@@ -6,7 +6,7 @@ from .rules import (
     normalize,
     select_relevant_transaction,
 )
-from .safety import safe_official_reply, sanitize_customer_reply
+from .safety import safe_official_reply, sanitize_customer_reply, sanitize_next_action
 from .schemas import AnalyzeTicketRequest, AnalyzeTicketResponse, Transaction
 
 
@@ -324,7 +324,10 @@ def analyze_ticket(req: AnalyzeTicketRequest) -> AnalyzeTicketResponse:
     human_review = needs_human_review(case_type, severity, verdict, tx, ambiguous)
 
     agent_summary = build_summary(req, tx, case_type, verdict, ambiguous)
-    recommended_next_action = build_next_action(case_type, tx, verdict, human_review, ambiguous)
+    recommended_next_action = sanitize_next_action(
+        build_next_action(case_type, tx, verdict, human_review, ambiguous),
+        req.language,
+    )
     customer_reply = sanitize_customer_reply(
         safe_official_reply(case_type, tx.transaction_id if tx else None, verdict, req.language, department),
         req.language

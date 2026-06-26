@@ -53,6 +53,28 @@ def sanitize_customer_reply(text: str, language: str | None = "en") -> str:
     return text
 
 
+def sanitize_next_action(text: str, language: str | None = "en") -> str:
+    """
+    Final guardrail for the internal recommended_next_action string.
+    The next-action is an instruction to a human agent, so the secret-asking
+    guardrail is not strictly required, but the unauthorized-promise guardrail
+    is: an internal recommendation must never tell an agent to confirm a
+    refund, reversal, account unblock, or recovery. If such language is found,
+    we fall back to a neutral, non-committal instruction.
+    """
+    if contains_unauthorized_promise(text):
+        if language == "bn":
+            return (
+                "অভ্যন্তরীণ রেকর্ড যাচাই করুন এবং যেকোনো যোগ্য পরিমাণ শুধু অফিসিয়াল চ্যানেলের মাধ্যমে "
+                "প্রক্রিয়া করুন। কোনো রিফান্ড, রিভার্সাল, আনব্লক বা অ্যাকাউন্ট রিকভারি নিশ্চিত করবেন না।"
+            )
+        return (
+            "Verify internal records and process any eligible amount only through official channels. "
+            "Do not confirm any refund, reversal, unblock, or account recovery."
+        )
+    return text
+
+
 def safe_official_reply(case_type: str, txn_id: str | None, verdict: str, language: str | None = "en", department: str | None = None) -> str:
     lang = language or "en"
 

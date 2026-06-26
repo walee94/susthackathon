@@ -1,10 +1,12 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.rules import select_relevant_transaction
+from app.rules import select_relevant_transaction, time_score, parse_hinted_time
+from app.safety import sanitize_next_action
 from app.schemas import Transaction
 
 client = TestClient(app)
@@ -230,3 +232,125 @@ def test_e2e_rerank_ambiguous_returns_null_and_ambiguous_reason_code():
     action = body["recommended_next_action"].lower()
     for forbidden in ("pin", "otp", "password", "cvv"):
         assert forbidden not in action
+
+
+# ---------------------------------------------------------------------------
+# Safety sanitizer for recommended_next_action. The internal action string
+# must never contain a confirmation of refund / reversal / unblock / recovery.
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_next_action_strips_unauthorized_promises_en():
+    out = sanitize_next_action("We will refund the customer now.", language="en")
+    assert "we will refund" not in out.lower()
+    assert "do not confirm any refund" in out.lower()
+
+
+def test_sanitize_next_action_strips_unauthorized_promises_bn():
+    out = sanitize_next_action("Refund is confirmed. পাঠিয়ে দিন।", language="bn")
+    assert "refund is confirmed" not in out.lower()
+    assert "রিফান্ড" in out  # fallback Bangla template includes the warning
+
+
+def test_sanitize_next_action_keeps_safe_phrasing():
+    safe = (
+        "Verify the transaction through official workflow before taking action. "
+        "Do not confirm any refund without authorization."
+    )
+    assert sanitize_next_action(safe, language="en") == safe
+
+
+def test_e2e_next_action_is_safe_across_full_response():
+    # Strong-match payload: the response must never contain "we will refund" or
+    # "refund is confirmed" in either customer-facing or agent-facing fields.
+    payload = {
+        "ticket_id": "TKT-SAFE-ACT",
+        "complaint": "I was charged twice for 1500. Please refund.",
+        "language": "en",
+        "channel": "in_app_chat",
+        "user_type": "customer",
+        "transaction_history": [
+            {"transaction_id": "TXN-D1", "timestamp": "2026-04-14T09:00:00Z",
+             "type": "payment", "amount": 1500, "counterparty": "MERCHANT-1",
+             "status": "completed"},
+            {"transaction_id": "TXN-D2", "timestamp": "2026-04-14T09:05:00Z",
+             "type": "payment", "amount": 1500, "counterparty": "MERCHANT-1",
+             "status": "completed"},
+        ],
+    }
+    res = client.post("/analyze-ticket", json=payload)
+    assert res.status_code == 200
+    body = res.json()
+    fields_to_check = ("customer_reply", "recommended_next_action", "agent_summary")
+    for field in fields_to_check:
+        lowered = body[field].lower()
+        for forbidden in ("we will refund", "refund is confirmed",
+                          "will refund you", "we will recover", "account unblock is confirmed"):
+            assert forbidden not in lowered, f"{field} leaked: {forbidden!r}"
+
+
+# ---------------------------------------------------------------------------
+# Time-proximity scoring: a complaint that says "around 2pm today" should
+# boost a transaction at 14:08 and penalize one on a different day.
+# ---------------------------------------------------------------------------
+
+
+def test_time_score_within_two_hours_returns_positive_bump():
+    ref = datetime(2026, 4, 14, 18, 0, 0, tzinfo=timezone.utc)
+    score = time_score("I sent 5000 around 2pm today.", "2026-04-14T14:08:22Z", reference=ref)
+    assert score == 2
+
+
+def test_time_score_within_six_hours_returns_small_bump():
+    ref = datetime(2026, 4, 14, 18, 0, 0, tzinfo=timezone.utc)
+    score = time_score("I paid 1500 this afternoon.", "2026-04-14T19:30:00Z", reference=ref)
+    assert score in (1, 2)  # afternoon=15 → 4.5h; within 6h
+
+
+def test_time_score_different_day_returns_negative():
+    ref = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    score = time_score("I paid 1500 yesterday around 10am.", "2026-04-14T11:00:00Z", reference=ref)
+    assert score == -2
+
+
+def test_time_score_missing_inputs_returns_zero():
+    assert time_score("I paid 1500.", None) == 0
+    assert time_score("just now", "not-a-timestamp") == 0
+
+
+def test_rerank_picks_closer_in_time_when_amount_ambiguous():
+    # Two transfers, same amount, same type. The complaint names the second
+    # counterparty's numeric id so only one candidate is plausible; the time
+    # bump for "around 2pm today" should still pick the 14:08 transaction.
+    history = [
+        _txn("TXN-MORNING", "transfer", 1000, "completed",
+             counterparty="MERCHANT-A", timestamp="2026-04-14T09:00:00Z"),
+        _txn("TXN-AFTERNOON", "transfer", 1000, "completed",
+             counterparty="MERCHANT-B", timestamp="2026-04-14T14:08:00Z"),
+    ]
+    ref = datetime(2026, 4, 14, 18, 0, 0, tzinfo=timezone.utc)
+    chosen, score, ambiguous = select_relevant_transaction(
+        "I sent 1000 taka to MERCHANT-B around 2pm today.",
+        history,
+        reference=ref,
+    )
+    assert chosen is not None
+    assert chosen.transaction_id == "TXN-AFTERNOON"
+    assert ambiguous is False
+
+
+def test_parse_hinted_time_supports_bangla():
+    ref = datetime(2026, 4, 14, 18, 0, 0, tzinfo=timezone.utc)
+    # An explicit numeric hour ("৪টায়") wins over the day-part default ("বিকাল" → 17).
+    hinted = parse_hinted_time("আজ বিকাল ৪টায় টাকা পাঠিয়েছি", reference=ref)
+    assert hinted is not None
+    assert hinted.hour == 4
+
+
+def test_parse_hinted_time_uses_day_part_when_no_digit():
+    ref = datetime(2026, 4, 14, 18, 0, 0, tzinfo=timezone.utc)
+    # No numeric hour is present, so the Bangla day-part "বিকাল" defaults to 17.
+    hinted = parse_hinted_time("আজ বিকালে টাকা পাঠিয়েছি", reference=ref)
+    assert hinted is not None
+    assert hinted.hour == 17
+    assert hinted.date() == ref.date()

@@ -1,11 +1,30 @@
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from .schemas import Transaction
 
 
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
+
+# Loose English/Bangla day-part keywords, mapped to a 24h hour.
+_DAY_PART_HOURS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"\b(morning)\b"), 9),
+    (re.compile(r"\b(afternoon)\b"), 15),
+    (re.compile(r"\b(evening)\b"), 19),
+    (re.compile(r"\bnight\b"), 22),
+    (re.compile(r"\bsubah|সকাল\b"), 9),
+    (re.compile(r"\bdupur|দুপুর\b"), 14),
+    (re.compile(r"\bbikal|বিকাল\b"), 17),
+    (re.compile(r"\brat|রাত\b"), 21),
+]
+
+# Hour tokens like "2pm", "14:00", "২টায়", "সকাল ১০টা".
+_HOUR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*(am|pm)\b"),
+    re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*:\s*\d{2}\b"),
+    re.compile(r"(?<!\d)([01]?\d|2[0-3])\s*(?:টায়|টা)\b"),
+)
 
 
 def normalize(text: str) -> str:
@@ -69,7 +88,86 @@ def parse_time(ts: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def txn_score(complaint: str, tx: Transaction) -> int:
+def parse_hinted_time(complaint: str, reference: Optional[datetime] = None) -> Optional[datetime]:
+    """
+    Best-effort extraction of a complaint's claimed time of the transaction.
+    Supports:
+      * relative day words: today / yesterday / আজ / গতকাল
+      * day-part words: morning/afternoon/evening/night + Bangla equivalents
+      * hour tokens: 2pm, 14:00, ২টায়, সকাল ১০টা
+    `reference` is the "now" anchor for relative phrases (defaults to UTC now).
+    """
+    if not complaint:
+        return None
+
+    text = normalize(complaint)
+    ref = reference or datetime.now(timezone.utc)
+    hour: Optional[int] = None
+
+    for pat in _HOUR_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        h = int(m.group(1))
+        if "pm" in m.group(0) and h < 12:
+            h += 12
+        hour = h
+        break
+
+    if hour is None:
+        for pat, default_hour in _DAY_PART_HOURS:
+            if pat.search(text):
+                hour = default_hour
+                break
+
+    if hour is None:
+        return None
+
+    base_day: datetime
+    if re.search(r"\byesterday\b|গতকাল", text):
+        base_day = (ref - timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+    elif re.search(r"\btoday\b|আজ", text):
+        base_day = ref.replace(hour=hour, minute=0, second=0, microsecond=0)
+    elif re.search(r"\blast night\b|গত রাতে", text):
+        base_day = (ref - timedelta(days=1)).replace(hour=hour, minute=0, second=0, microsecond=0)
+    else:
+        # No relative anchor; assume same day as reference.
+        base_day = ref.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+    return base_day
+
+
+def time_score(complaint: str, txn_timestamp: Optional[str],
+               reference: Optional[datetime] = None) -> int:
+    """
+    Score bump based on how close the complaint's hinted time is to the txn
+    timestamp. Returns:
+        +2 if within 2 hours
+        +1 if within 6 hours
+        -2 if the hinted time is on a different calendar day
+         0 if either side is missing/unparseable
+    A negative score is allowed here; txn_score clamps the result to >= 0.
+    `reference` is the "now" anchor used to interpret "today"/"yesterday".
+    """
+    if not txn_timestamp:
+        return 0
+    hinted = parse_hinted_time(complaint, reference=reference)
+    txn_dt = parse_time(txn_timestamp)
+    if hinted is None or txn_dt is None:
+        return 0
+
+    delta = abs((txn_dt - hinted).total_seconds())
+    if delta <= 2 * 3600:
+        return 2
+    if delta <= 6 * 3600:
+        return 1
+    if hinted.date() != txn_dt.date():
+        return -2
+    return 0
+
+
+def txn_score(complaint: str, tx: Transaction,
+              reference: Optional[datetime] = None) -> int:
     score = 0
     lowered = normalize(complaint)
 
@@ -83,6 +181,9 @@ def txn_score(complaint: str, tx: Transaction) -> int:
 
     if complaint_mentions_counterparty(complaint, tx.counterparty):
         score += 5
+
+    # Light time-proximity signal. Cheap bonus, never below 0 from this branch.
+    score += max(time_score(complaint, tx.timestamp, reference=reference), 0)
 
     type_words = {
         "transfer": [
@@ -159,7 +260,8 @@ def find_duplicate_payment_pair(history: list[Transaction]) -> Optional[Transact
     return sorted(best_group, key=sort_key)[-1]
 
 
-def likely_ambiguous_match(complaint: str, history: list[Transaction], best_score: int) -> bool:
+def likely_ambiguous_match(complaint: str, history: list[Transaction], best_score: int,
+                           reference: Optional[datetime] = None) -> bool:
     """
     If several transactions are equally plausible, do not guess.
     Public sample 8 expects null relevant_transaction_id for multiple 1000 BDT transfers.
@@ -167,7 +269,7 @@ def likely_ambiguous_match(complaint: str, history: list[Transaction], best_scor
     if len(history) < 2 or best_score < 3:
         return False
 
-    scored = [(txn_score(complaint, tx), tx) for tx in history]
+    scored = [(txn_score(complaint, tx, reference=reference), tx) for tx in history]
     top = max(score for score, _ in scored)
     if top < 3:
         return False
@@ -190,7 +292,8 @@ def likely_ambiguous_match(complaint: str, history: list[Transaction], best_scor
     return False
 
 
-def select_relevant_transaction(complaint: str, history: list[Transaction]) -> tuple[Optional[Transaction], int, bool]:
+def select_relevant_transaction(complaint: str, history: list[Transaction],
+                                reference: Optional[datetime] = None) -> tuple[Optional[Transaction], int, bool]:
     if not history:
         return None, 0, False
 
@@ -199,14 +302,14 @@ def select_relevant_transaction(complaint: str, history: list[Transaction]) -> t
         if duplicate:
             return duplicate, 10, False
 
-    scored = [(txn_score(complaint, tx), tx) for tx in history]
+    scored = [(txn_score(complaint, tx, reference=reference), tx) for tx in history]
     scored.sort(key=lambda x: x[0], reverse=True)
 
     best_score, best_tx = scored[0]
     if best_score < 3:
         return None, best_score, False
 
-    ambiguous = likely_ambiguous_match(complaint, history, best_score)
+    ambiguous = likely_ambiguous_match(complaint, history, best_score, reference=reference)
     if ambiguous:
         return None, best_score, True
 
