@@ -7,7 +7,7 @@
   "department": "dispute_resolution",
   "agent_summary": "Ticket TKT-001: customer reports a wrong_transfer issue linked to TXN-9101 for 5000 BDT. Evidence verdict: consistent.",
   "recommended_next_action": "Escalate TXN-9101 for human review and verify transaction status, amount, counterparty, and eligibility through official workflow.",
-  "customer_reply": "We have noted your concern about transaction TXN-9101. Our support team will verify the details. Any eligible amount will be processed through official channels after verification.",
+  "customer_reply": "We have noted your concern. Please use only official support channels for updates. Do not share your PIN, OTP, password, CVV, or full card number with anyone. Any eligible amount will be processed through official channels after verification.",
   "human_review_required": true,
   "confidence": 0.92,
   "reason_codes": [

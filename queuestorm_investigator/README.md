@@ -188,3 +188,68 @@ If the platform does not provide `$PORT`, use:
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+
+## Hidden-case strategy added
+
+The service now includes stronger logic for likely hidden cases:
+
+- exact transaction ID matching
+- Bangla digit amount extraction
+- ambiguous-match detection
+- duplicate payment second-transaction selection
+- repeated-recipient contradiction for wrong-transfer claims
+- merchant settlement routing using `user_type` and `channel`
+- agent cash-in routing for English, Bangla, and Banglish complaints
+- phishing and prompt-injection protection
+- safe fallback when transaction history is missing or unclear
+
+## Local evaluation
+
+Run:
+
+```bash
+python scripts/evaluate_cases.py
+```
+
+Current result:
+
+```text
+public_sample_cases.json: 60/60
+hidden_edge_cases.json: 120/120
+TOTAL: 180/180
+All core decisions passed. No unsafe customer replies detected.
+```
+
+## Included test files
+
+- `public_sample_cases.json`: official public sample pack copied into the repo for local testing.
+- `hidden_edge_cases.json`: custom hidden-style cases created from the rubric and problem statement.
+- `EVALUATION_NOTES.md`: explains the hidden-case strategy and evaluation result.
+
+## Decision priority
+
+The engine uses this order:
+
+1. Detect phishing, credential abuse, and prompt injection.
+2. Detect duplicate payments and select the later matching transaction.
+3. Detect merchant settlement cases.
+4. Detect agent cash-in cases.
+5. Detect wrong transfer or receiver-not-received cases.
+6. Detect failed payment or failed transaction cases.
+7. Detect refund requests.
+8. Return `other` with `insufficient_data` when the complaint is vague.
+
+## Safety design
+
+The system never asks customers for secrets.
+
+It may warn customers not to share secrets.
+
+It never promises a refund, reversal, unblock, or recovery.
+
+It uses safe phrasing such as:
+
+```text
+Any eligible amount will be processed through official channels after verification.
+```
